@@ -77,3 +77,71 @@ func TestValidateCloudflareNeedsIP(t *testing.T) {
 		t.Fatalf("should pass with IP: %v", err)
 	}
 }
+
+func TestValidateUpstreamModeDefaultsLoopback(t *testing.T) {
+	c := valid() // applyDefaults ran
+	if c.NPMplus.UpstreamMode != UpstreamModeLoopback {
+		t.Fatalf("upstream_mode default = %q, want %q", c.NPMplus.UpstreamMode, UpstreamModeLoopback)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("default loopback should pass: %v", err)
+	}
+}
+
+func TestValidateUpstreamModeInvalid(t *testing.T) {
+	c := valid()
+	c.NPMplus.UpstreamMode = "host"
+	if c.Validate() == nil {
+		t.Fatal("expected rejection of an unknown upstream_mode")
+	}
+}
+
+func TestValidateContainerModeNeedsNetwork(t *testing.T) {
+	c := valid()
+	c.NPMplus.UpstreamMode = UpstreamModeContainer
+	if c.Validate() == nil {
+		t.Fatal("expected container mode without a network to be rejected")
+	}
+	c.NPMplus.Network = "statio-edge"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("container mode with a network should pass: %v", err)
+	}
+}
+
+func TestValidateLoopbackRejectsNetwork(t *testing.T) {
+	c := valid()
+	c.NPMplus.Network = "statio-edge" // network with loopback is a config mistake
+	if c.Validate() == nil {
+		t.Fatal("expected loopback+network to be rejected")
+	}
+}
+
+func TestValidateInsecureSkipVerifyLoopbackOnly(t *testing.T) {
+	c := valid()
+	c.NPMplus.BaseURL = "https://127.0.0.1:81"
+	c.NPMplus.InsecureSkipVerify = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("loopback insecure_skip_verify should pass: %v", err)
+	}
+	// A remote base_url must never skip TLS verification (would open a MITM surface).
+	c.NPMplus.BaseURL = "https://npm.example.com:81"
+	if c.Validate() == nil {
+		t.Fatal("expected remote insecure_skip_verify to be rejected")
+	}
+}
+
+func TestIsLoopbackURL(t *testing.T) {
+	cases := map[string]bool{
+		"https://127.0.0.1:81":      true,
+		"http://localhost:81":       true,
+		"https://[::1]:81":          true,
+		"https://npm.example.com":   false,
+		"https://192.168.1.5:81":    false,
+		"https://127.0.0.1.evil.io": false,
+	}
+	for u, want := range cases {
+		if got := IsLoopbackURL(u); got != want {
+			t.Errorf("IsLoopbackURL(%q) = %v, want %v", u, got, want)
+		}
+	}
+}

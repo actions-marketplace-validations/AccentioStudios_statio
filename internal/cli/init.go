@@ -2,17 +2,24 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/accentiostudios/statio/internal/config"
+	"github.com/accentiostudios/statio/internal/dns"
 	"github.com/accentiostudios/statio/internal/fsutil"
+	"github.com/accentiostudios/statio/internal/proxy"
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed assets/*.tmpl
@@ -94,10 +101,12 @@ func newInitServerCmd() *cobra.Command {
 	var oauthStdin bool
 	cmd := &cobra.Command{
 		Use:   "server",
-		Short: "Set up the deploy agent on this server (interactive)",
-		Long: "Sets up the agent on THIS machine. It does not ask for any repo — you authorize each\n" +
-			"app later with `statio app add`. It takes the agent's Tailscale OAuth client (tag:agent) and\n" +
-			"joins the tailnet; CI joins separately with its own tag:ci OAuth client.",
+		Short: "Configure and start the deploy agent on this server",
+		Long: "Configures the agent on this machine, writes its systemd unit, and starts it. It asks\n" +
+			"for no repo: you accept each app later with `statio app add`. It takes the agent's\n" +
+			"Tailscale OAuth client (tag:agent). CI joins with its own tag:ci client.\n\n" +
+			"Guide: https://statio.accentio.dev/tutorials/first-deploy/",
+		Example: "  sudo statio init server",
 		PreRunE: rootPreRun,
 		RunE: func(c *cobra.Command, _ []string) error {
 			if issuer == "" {
@@ -112,36 +121,37 @@ func newInitServerCmd() *cobra.Command {
 				}
 				if err := runForm(
 					inputField("Name of this server",
-						"Tailscale will give it the address <name>.<your-tailnet>.ts.net, and CI uses that address to send the deploy. With a single server, 'statio' is fine.",
+						"Tailscale gives it the address <name>.<your-tailnet>.ts.net, and CI sends the deploy to that address. With one server, 'statio' works.",
 						"statio", &hostname, true),
 				); err != nil {
 					return err
 				}
-				sectionTitle("First, set up Tailscale (once, on the web)")
-				info("CI reaches this server over Tailscale instead of SSH. Do three steps in the admin")
-				info("console, in order — an OAuth client can only use tags that already exist:")
+				sectionTitle("Step 1 of 2 · Tailscale, in the admin console")
+				info("Do these three steps in order, then come back here. An OAuth client can only")
+				info("carry a tag that already exists, so the tags come first.")
 				info("")
-				info("1. Access controls — define the tags. Each tag must OWN ITSELF so its OAuth client")
-				info("   can register/mint with it (else: 'tags ... not permitted'). Paste & save:")
+				info("1. Access controls: save this policy. Each tag owns itself, which is what lets")
+				info("   its OAuth client register with it.")
 				codeBlock(`{"tagOwners":{"tag:agent":["autogroup:admin","tag:agent"],"tag:ci":["autogroup:admin","tag:ci"]},"acls":[{"action":"accept","src":["tag:ci"],"dst":["tag:agent:443"]}]}`)
 				info("")
-				info("2. The AGENT's OAuth client (this server joins with it). Settings -> OAuth clients ->")
-				info("   Generate. 'Custom scopes', both Write: auth_keys (Keys -> Auth Keys) + devices:core")
-				info("   (Devices -> Core). When asked for tags, pick tag:agent. Copy its id + secret —")
-				info("   you paste them below. https://login.tailscale.com/admin/settings/oauth")
+				info("2. Settings -> OAuth clients -> Generate. Pick 'Custom scopes', Write on")
+				info("   auth_keys (Keys -> Auth Keys) and on devices:core (Devices -> Core). Assign")
+				info("   tag:agent. Copy its id and secret; you paste them below.")
+				info("   https://login.tailscale.com/admin/settings/oauth")
 				info("")
-				info("3. CI's OWN OAuth client (GitHub Actions joins with it — kept separate so CI can never")
-				info("   act as the agent). Generate a SECOND client, scope auth_keys (Write), tag tag:ci.")
-				info("   Set its id + secret as GitHub secrets (on YOUR machine, org-wide or per repo):")
+				info("3. Generate a second client. Custom scopes, Write on auth_keys. Assign tag:ci.")
+				info("   Set its id and secret as GitHub secrets, from your machine:")
 				codeBlock(
 					"gh secret set STATIO_TS_OAUTH_CLIENT_ID --org <your-org> --visibility all --body '<ci client id>'",
 					"gh secret set STATIO_TS_OAUTH_SECRET    --org <your-org> --visibility all --body '<ci client secret>'",
 				)
 				info("")
-				info("Paste the AGENT's OAuth client (step 2 — NOT the CI one):")
+				info("Full guide: https://statio.accentio.dev/how-to/set-up-tailscale/")
+				sectionTitle("Step 2 of 2 · Paste the agent's OAuth client")
+				info("Use the client from step 2, the one tagged tag:agent.")
 				if err := runForm(
-					inputField("Agent OAuth client ID", "The agent client's id (not secret).", "k123ABC...", &clientID, true),
-					passwordField("Agent OAuth client secret", "Starts with tskey-client-…; stored 0600 root, never printed", &clientSecret),
+					inputField("Agent OAuth client ID", "The client id, not the secret.", "k123ABC...", &clientID, true),
+					passwordField("Agent OAuth client secret", "Starts with tskey-client-. Stored 0600 root, never printed.", &clientSecret),
 				); err != nil {
 					return err
 				}
@@ -185,9 +195,9 @@ func newInitServerCmd() *cobra.Command {
 					// print the exact CI target and 'statio app add' can fill it in for the user.
 					info("Waiting for the agent to join the tailnet…")
 					if aud := waitAudience("/var/lib/statio", 25*time.Second); aud != "" {
-						okLine("Agent address — use this as the CI 'target': %s", aud)
+						okLine("Agent address (use this as the CI 'target'): %s", aud)
 					} else {
-						info("Still joining. Its address (the CI 'target') shows in 'statio status' once up.")
+						info("Still joining. Its address shows in 'statio status' once it is up.")
 					}
 				}
 			} else {
@@ -200,9 +210,9 @@ func newInitServerCmd() *cobra.Command {
 			// Keeping CI on a separate client means CI can never act as the agent; what each repo may
 			// deploy is fixed by its cosign signer (set per app in `statio app add`).
 			sectionTitle("CI credential")
-			info("CI uses the SEPARATE tag:ci OAuth client from step 3 — set those two GitHub secrets")
-			info("(STATIO_TS_OAUTH_CLIENT_ID + STATIO_TS_OAUTH_SECRET) if you haven't. The agent never")
-			info("hands CI a key; the OAuth client secret doesn't expire, so there's nothing to rotate.")
+			info("CI joins with the tag:ci client from step 3. Set STATIO_TS_OAUTH_CLIENT_ID and")
+			info("STATIO_TS_OAUTH_SECRET as GitHub secrets if you have not. The agent hands CI no")
+			info("key, and the OAuth client secret has no expiry, so nothing needs rotating.")
 
 			sectionTitle("Next steps")
 			codeBlock(
@@ -297,76 +307,402 @@ func writeAgentUnit() error {
 
 // ======================== init integrations =========================
 
+const (
+	npmplusSecretPath    = "/etc/statio/secrets/npmplus.json"
+	cloudflareSecretPath = "/etc/statio/secrets/cloudflare.json"
+)
+
 func newInitIntegrationsCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "integrations",
-		Short:   "Configure NPMplus + Cloudflare + the pinned public IP (interactive)",
+		Use:   "integrations",
+		Short: "Configure NPMplus, Cloudflare and the pinned public IP",
+		Long: "Configures the optional reverse proxy (NPMplus) and DNS (Cloudflare), writing both\n" +
+			"into the agent config. Re-run it any time to change one detail: it fills every answer\n" +
+			"with the current value.\n\n" +
+			"Guide: https://statio.accentio.dev/how-to/add-a-domain/",
+		Example: "  sudo statio init integrations",
 		PreRunE: rootPreRun,
 		RunE: func(c *cobra.Command, _ []string) error {
 			if !interactive() {
 				return fmt.Errorf("init integrations is interactive; run it in a terminal")
 			}
+			cfg, err := loadConfigForEdit(defaultConfigPath)
+			if err != nil {
+				return fmt.Errorf("this server is not set up yet. Run 'sudo statio init server' first (%w)", err)
+			}
 			banner("statio · init integrations", "Reverse proxy (NPMplus) and DNS (Cloudflare)")
+			info("Optional. Set this up to serve an app on a public domain, with TLS through NPMplus")
+			info("and a Cloudflare A record. Deploys work without it. Re-run it to edit one value;")
+			info("the current settings are filled in below.")
 
-			doNPM, err := confirm("Set up NPMplus (reverse proxy)?")
-			if err != nil {
+			if err := configureNPMplus(cfg); err != nil {
 				return err
 			}
-			if doNPM {
-				url, identity, secret := "http://npmplus:81", "statio-agent", ""
-				if err := runForm(
-					inputField("NPMplus base URL", "Localhost or docker network name", "http://npmplus:81", &url, true),
-					inputField("NPMplus API identity", "Dedicated non-admin user", "statio-agent", &identity, true),
-					passwordField("NPMplus API secret", "Stored 0600 root", &secret),
-				); err != nil {
-					return err
-				}
-				if err := writeJSONSecret("/etc/statio/secrets/npmplus.json",
-					fmt.Sprintf(`{"base_url":%q,"identity":%q,"secret":%q}`, url, identity, secret)); err != nil {
-					return err
-				}
-				okLine("NPMplus configured")
-				sectionTitle("Add to /etc/statio/config.yaml")
-				codeBlock("npmplus:", "  base_url: "+url, "  credentials_file: /etc/statio/secrets/npmplus.json")
-			}
-
-			doCF, err := confirm("Set up Cloudflare (DNS)?")
-			if err != nil {
+			if err := configureCloudflare(cfg); err != nil {
 				return err
 			}
-			if doCF {
-				zoneID, apex, ip, token := "", "", "", ""
-				if err := runForm(
-					inputField("Cloudflare Zone ID", "Dashboard → your zone → Overview", "", &zoneID, true),
-					inputField("Zone apex", "The root domain (e.g. example.com)", "example.com", &apex, true),
-					inputField("Server public IP", "Where the A records will point", "203.0.113.10", &ip, true),
-					passwordField("Cloudflare API token", "Zone.DNS:Edit scope on this zone; 0600 root", &token),
-				); err != nil {
-					return err
-				}
-				if err := writeJSONSecret("/etc/statio/secrets/cloudflare.json",
-					fmt.Sprintf(`{"api_token":%q,"zone_id":%q}`, token, zoneID)); err != nil {
-					return err
-				}
-				okLine("Cloudflare configured")
-				sectionTitle("Add to /etc/statio/config.yaml")
-				codeBlock(
-					"cloudflare:",
-					"  credentials_file: /etc/statio/secrets/cloudflare.json",
-					"  zone_apex: "+apex,
-					"dns:",
-					"  public_ip: "+ip,
-					"  ttl: 1",
-					"  proxied: false",
-				)
+
+			if err := saveConfig(defaultConfigPath, cfg); err != nil {
+				return err
 			}
-			if !doNPM && !doCF {
-				warnLine("Nothing to configure.")
+			okLine("Wrote %s", defaultConfigPath)
+
+			// The agent reads its config once at boot (fail-closed, no hot reload), so a running
+			// agent still serves the OLD settings until restarted. Offer to do it right here —
+			// a skipped restart is the classic "wizard passed but CI still fails" trap.
+			if systemctlAvailable() && agentActive() {
+				restart, err := confirm("Restart the agent now to apply the new settings?")
+				if err != nil {
+					return err
+				}
+				if restart {
+					if err := restartAgent(); err != nil {
+						warnLine("could not restart the agent: %v", err)
+						codeBlock("sudo systemctl restart statio-agent")
+						return nil
+					}
+					okLine("Agent restarted. The new settings are live.")
+				} else {
+					warnLine("Not restarted. The running agent keeps the old settings until you run:")
+					codeBlock("sudo systemctl restart statio-agent")
+				}
+			} else {
+				info("Restart the agent to apply: sudo systemctl restart statio-agent")
 			}
 			return nil
 		},
 	}
 	return cmd
+}
+
+// configureNPMplus runs the (re-runnable) NPMplus section: it pre-fills from the current config +
+// stored secret, asks only what changed, and writes both the secret file and the config fields
+// (base_url, credentials_file, upstream_mode, network). Answering "no" disables NPMplus.
+func configureNPMplus(cfg *config.Config) error {
+	enabled := cfg.NPMplus.BaseURL != ""
+	prompt := "Set up NPMplus (reverse proxy)?"
+	if enabled {
+		prompt = "NPMplus is configured. Keep / edit it?"
+	}
+	doNPM, err := confirm(prompt)
+	if err != nil {
+		return err
+	}
+	if !doNPM {
+		if enabled {
+			warnLine("Disabling NPMplus (the agent will stop reconciling proxy hosts).")
+			cfg.NPMplus = config.NPMplusConfig{UpstreamMode: config.UpstreamModeLoopback}
+		}
+		return nil
+	}
+
+	info("In NPMplus, create a dedicated non-admin user (Users, then Add). Enter that user's login")
+	info("email and password below. The agent reaches the NPMplus admin API over localhost.")
+	apiURL, identity, curSecret := readNPMplusSecret(npmplusSecretPath)
+	if apiURL == "" {
+		apiURL = "https://127.0.0.1:81"
+	}
+	var secret string
+	var insecure bool
+	for {
+		secret = ""
+		secretDesc := "That user's password (the API 'secret'). Stored 0600, root-only."
+		if curSecret != "" {
+			secretDesc = "Leave BLANK to keep the current password. " + secretDesc
+		}
+		if err := runForm(
+			inputField("NPMplus admin API URL", "How the agent reaches NPMplus. The agent runs on the host, so this is host loopback: https://127.0.0.1:81. The scheme is auto-detected.", "https://127.0.0.1:81", &apiURL, true),
+			inputField("NPMplus login email", "The dedicated non-admin NPMplus user (the API 'identity').", "statio@your-domain.com", &identity, true),
+			huh.NewInput().Title("NPMplus password").Description(secretDesc).EchoMode(huh.EchoModePassword).Value(&secret),
+		); err != nil {
+			return err
+		}
+		if secret == "" {
+			secret = curSecret // keep existing on a blank answer
+		}
+		if secret == "" {
+			failLine("The NPMplus password is required, and none is stored yet")
+			continue
+		}
+
+		// Test the credentials NOW — trying every sensible connection variant (as entered,
+		// the other scheme, and https with NPMplus's self-signed admin cert on loopback) —
+		// so a bad URL/login fails here in the wizard, not later in CI as proxy_unreachable.
+		// Whichever variant authenticates is the one that gets configured.
+		info("Testing the NPMplus connection…")
+		finalURL, ins, err := probeNPMplus(context.Background(), strings.TrimSpace(apiURL), strings.TrimSpace(identity), secret)
+		if err == nil {
+			if finalURL != strings.TrimSpace(apiURL) {
+				info("Connected via %s. Saving that URL.", finalURL)
+			}
+			apiURL, insecure = finalURL, ins
+			okLine("NPMplus reachable and credentials accepted")
+			break
+		}
+		failLine("NPMplus test failed: %v", err)
+		retry, cerr := confirm("Retry with different values?")
+		if cerr != nil {
+			return cerr
+		}
+		if retry {
+			continue
+		}
+		saveAnyway, cerr := confirm("Save it unverified? A deploy that asks for a domain fails preflight until this works")
+		if cerr != nil {
+			return cerr
+		}
+		if !saveAnyway {
+			return fmt.Errorf("NPMplus not configured (connection test failed)")
+		}
+		break
+	}
+
+	// Data-plane topology — how NPMplus reaches your APP. The devops decides; statio supports both.
+	mode := cfg.NPMplus.UpstreamMode
+	if mode == "" {
+		mode = config.UpstreamModeLoopback
+	}
+	if err := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().
+		Title("How does NPMplus reach your app?").
+		Description("loopback: NPMplus runs on the host network and forwards to 127.0.0.1:<port>. container: NPMplus and your app share a docker network, and it forwards by container name.").
+		Options(
+			huh.NewOption("loopback, over the host (default)", config.UpstreamModeLoopback),
+			huh.NewOption("container, over a shared docker network", config.UpstreamModeContainer),
+		).Value(&mode))).WithTheme(huh.ThemeCharm()).Run(); err != nil {
+		return err
+	}
+	network := cfg.NPMplus.Network
+	if mode == config.UpstreamModeContainer {
+		if err := runForm(serviceNameField("Shared docker network",
+			"The docker network NPMplus and your app both join. Attach NPMplus to it yourself; statio attaches your app. For example statio-edge.",
+			"statio-edge", &network)); err != nil {
+			return err
+		}
+	} else {
+		network = "" // loopback must not carry a network
+	}
+
+	if err := writeJSONSecret(npmplusSecretPath,
+		fmt.Sprintf(`{"base_url":%q,"identity":%q,"secret":%q}`, apiURL, identity, secret)); err != nil {
+		return err
+	}
+	cfg.NPMplus = config.NPMplusConfig{
+		BaseURL: apiURL, CredentialsFile: npmplusSecretPath,
+		UpstreamMode: mode, Network: network,
+		InsecureSkipVerify: insecure,
+	}
+	okLine("NPMplus configured (%s mode)", mode)
+	return nil
+}
+
+// npmplusCandidate is one way to reach the NPMplus admin API the wizard will try.
+type npmplusCandidate struct {
+	url      string
+	insecure bool // accept a self-signed cert (loopback only)
+}
+
+// npmplusCandidates expands the operator-entered URL into every sensible connection variant, in
+// preference order: exactly as entered first, then the same host on the OTHER scheme (NPMplus
+// serves its admin port over HTTPS by default, so an `http://` guess is common), each tried
+// strictly before falling back to accepting a self-signed cert — and that fallback only for a
+// loopback host (the same rule config validation enforces).
+func npmplusCandidates(raw string) []npmplusCandidate {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return []npmplusCandidate{{url: raw}}
+	}
+	loop := config.IsLoopbackURL(raw)
+	var out []npmplusCandidate
+	seen := map[npmplusCandidate]bool{}
+	add := func(c npmplusCandidate) {
+		if !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	add(npmplusCandidate{url: raw})
+	if u.Scheme == "https" && loop {
+		add(npmplusCandidate{url: raw, insecure: true})
+	}
+	alt := *u
+	if u.Scheme == "http" {
+		alt.Scheme = "https"
+	} else {
+		alt.Scheme = "http"
+	}
+	add(npmplusCandidate{url: alt.String()})
+	if alt.Scheme == "https" && loop {
+		add(npmplusCandidate{url: alt.String(), insecure: true})
+	}
+	return out
+}
+
+// probeNPMplus tries every candidate until one authenticates (a read-only token mint + host
+// list). It returns the WINNING url + whether it needed the self-signed concession — exactly
+// what gets persisted, so the tested config and the saved config can never differ.
+func probeNPMplus(ctx context.Context, raw, identity, secret string) (string, bool, error) {
+	var lastErr error
+	for _, cand := range npmplusCandidates(raw) {
+		cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		var opts []proxy.Option
+		if cand.insecure {
+			opts = append(opts, proxy.WithInsecureTLS())
+		}
+		err := proxy.New(cand.url, identity, secret, opts...).Check(cctx)
+		cancel()
+		if err == nil {
+			return cand.url, cand.insecure, nil
+		}
+		lastErr = err
+	}
+	return "", false, lastErr
+}
+
+// configureCloudflare runs the (re-runnable) Cloudflare/DNS section, pre-filled from the current
+// config + stored secret. Answering "no" disables DNS.
+func configureCloudflare(cfg *config.Config) error {
+	enabled := cfg.Cloudflare.CredentialsFile != ""
+	prompt := "Set up Cloudflare (DNS)?"
+	if enabled {
+		prompt = "Cloudflare is configured. Keep / edit it?"
+	}
+	doCF, err := confirm(prompt)
+	if err != nil {
+		return err
+	}
+	if !doCF {
+		if enabled {
+			warnLine("Disabling Cloudflare DNS.")
+			cfg.Cloudflare = config.CloudflareConfig{}
+			cfg.DNS = config.DNSConfig{}
+		}
+		return nil
+	}
+	info("Create a scoped API token at Cloudflare, under My Profile, API Tokens, Create Token.")
+	info("Give it Zone.DNS:Edit on this zone alone. Paste it below. A global key does not fit here.")
+	curToken, curZoneID := readCloudflareSecret(cloudflareSecretPath)
+	zoneID, apex, ip := curZoneID, cfg.Cloudflare.ZoneApex, cfg.DNS.PublicIP
+	var token string
+	for {
+		token = ""
+		tokenDesc := "The scoped token (Zone.DNS:Edit). Stored 0600, root-only."
+		if curToken != "" {
+			tokenDesc = "Leave BLANK to keep the current token. " + tokenDesc
+		}
+		if err := runForm(
+			inputField("Cloudflare Zone ID", "Dashboard, your domain, Overview, right column. A 32-character hex id.", "", &zoneID, true),
+			inputField("Zone apex", "The root domain the zone covers, such as example.com.", "example.com", &apex, true),
+			inputField("Server public IP", "The public IPv4 the A records point to.", "203.0.113.10", &ip, true),
+			huh.NewInput().Title("Cloudflare API token").Description(tokenDesc).EchoMode(huh.EchoModePassword).Value(&token),
+		); err != nil {
+			return err
+		}
+		if token == "" {
+			token = curToken
+		}
+		if token == "" {
+			failLine("The Cloudflare API token is required, and none is stored yet")
+			continue
+		}
+
+		// Test the token + zone NOW (a read-only GET of the zone), so a typo fails here in the
+		// wizard instead of surfacing later as a degraded deploy or a failed preflight.
+		info("Testing the Cloudflare token…")
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := dns.New(token, strings.TrimSpace(zoneID), "").Check(cctx)
+		cancel()
+		if err == nil {
+			okLine("Cloudflare token accepted for the zone")
+			break
+		}
+		failLine("Cloudflare test failed: %v", err)
+		retry, cerr := confirm("Retry with different values?")
+		if cerr != nil {
+			return cerr
+		}
+		if retry {
+			continue
+		}
+		saveAnyway, cerr := confirm("Save it unverified?")
+		if cerr != nil {
+			return cerr
+		}
+		if !saveAnyway {
+			return fmt.Errorf("Cloudflare not configured (token test failed)")
+		}
+		break
+	}
+	if err := writeJSONSecret(cloudflareSecretPath,
+		fmt.Sprintf(`{"api_token":%q,"zone_id":%q}`, token, zoneID)); err != nil {
+		return err
+	}
+	cfg.Cloudflare = config.CloudflareConfig{CredentialsFile: cloudflareSecretPath, ZoneApex: apex}
+	if cfg.DNS.TTL == 0 {
+		cfg.DNS.TTL = 1
+	}
+	cfg.DNS.PublicIP = ip
+	okLine("Cloudflare configured")
+	return nil
+}
+
+// loadConfigForEdit reads the agent config WITHOUT applying defaults or validating, so the wizard
+// can round-trip it (pre-fill, edit one field, write back). It preserves every setting statio's
+// config schema models; YAML comments and any hand-added unknown keys are NOT preserved (the
+// round-trip goes through the typed struct), so /etc/statio/config.yaml is managed by statio.
+func loadConfigForEdit(path string) (*config.Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c config.Config
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	// Defaults are normally applied by config.Load at boot; apply the one that affects validation
+	// here so a pre-feature config (no upstream_mode) round-trips and validates cleanly.
+	if c.NPMplus.UpstreamMode == "" {
+		c.NPMplus.UpstreamMode = config.UpstreamModeLoopback
+	}
+	return &c, nil
+}
+
+// saveConfig validates the edited config (fail-closed, the same checks the agent runs at boot) and
+// writes it back 0600 root. Validating here means a bad combination (e.g. container mode without a
+// network) is caught in the wizard, not at the next agent restart.
+func saveConfig(path string, c *config.Config) error {
+	if err := c.Validate(); err != nil {
+		return fmt.Errorf("refusing to write an invalid config: %w", err)
+	}
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return fsutil.SecureWrite(path, data, 0o600)
+}
+
+// readNPMplusSecret best-effort reads the stored NPMplus credential to pre-fill the wizard. The
+// secret (password) is returned so a blank answer can keep it; it is never displayed.
+func readNPMplusSecret(path string) (url, identity, secret string) {
+	var s struct {
+		BaseURL  string `json:"base_url"`
+		Identity string `json:"identity"`
+		Secret   string `json:"secret"`
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &s)
+	}
+	return s.BaseURL, s.Identity, s.Secret
+}
+
+func readCloudflareSecret(path string) (token, zoneID string) {
+	var s struct {
+		APIToken string `json:"api_token"`
+		ZoneID   string `json:"zone_id"`
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &s)
+	}
+	return s.APIToken, s.ZoneID
 }
 
 func writeJSONSecret(path, json string) error {
@@ -383,7 +719,13 @@ func newInitRepoCmd() *cobra.Command {
 	var createWorkflow bool
 	cmd := &cobra.Command{
 		Use:   "repo",
-		Short: "Prepare your repo for statio (statio.yaml + how to call the Action) — run INSIDE the repo",
+		Short: "Write statio.yaml and the workflow step, inside your repo",
+		Long: "Run this inside your project's repo, not on the server. It writes statio.yaml, prints\n" +
+			"the app's cosign signing identity for `statio app add`, and either generates\n" +
+			".github/workflows/deploy.yml or prints the step to paste into the workflow you have.\n" +
+			"It never edits an existing workflow.\n\n" +
+			"Guide: https://statio.accentio.dev/tutorials/first-deploy/",
+		Example: "  statio init repo",
 		RunE: func(c *cobra.Command, _ []string) error {
 			// Auto-detect owner/repo up front (local git read; works for private repos)
 			// so the wizard comes prefilled and we can print the exact signing identity.
@@ -398,14 +740,14 @@ func newInitRepoCmd() *cobra.Command {
 			}
 
 			if interactive() && (target == "" || service == "" || image == "") {
-				banner("statio · init repo", "Interactive wizard — runs INSIDE your project's repo (not on the server)")
+				banner("statio · init repo", "Runs inside your project's repo, not on the server")
 				if repoOK {
-					info("Repo detected: %s/%s — I filled in the defaults; just confirm or edit.", owner, repo)
+					info("Repo detected: %s/%s. The defaults below come from it. Confirm or edit them.", owner, repo)
 				}
 				if err := runForm(
-					inputField("Server address (Tailscale)", "The name you gave the agent + .<your-tailnet>.ts.net. E.g. statio.your-org.ts.net", "statio.<your-tailnet>.ts.net", &target, true),
-					inputField("Service", "Service name (must be accepted on the agent with 'statio app add')", "api", &service, true),
-					inputField("Image repository", "Your image repo (must match 'statio app add --image')", "ghcr.io/accentiostudios/api", &image, true),
+					inputField("Server address (Tailscale)", "The name you gave the agent, plus .<your-tailnet>.ts.net. For example statio.your-org.ts.net", "statio.<your-tailnet>.ts.net", &target, true),
+					inputField("Service", "The service name, accepted on the agent with 'statio app add'.", "api", &service, true),
+					inputField("Image repository", "Your image repo. It must match 'statio app add --image'.", "ghcr.io/accentiostudios/api", &image, true),
 				); err != nil {
 					return err
 				}
@@ -422,37 +764,37 @@ func newInitRepoCmd() *cobra.Command {
 				if err := os.WriteFile(statioOut, py, 0o644); err != nil {
 					return err
 				}
-				okLine("Generated %s (edit your app's services/env)", statioOut)
+				okLine("Generated %s. Edit its services and env to match your app.", statioOut)
 			} else {
-				info("%s already exists; left untouched", statioOut)
+				info("%s already exists. Left untouched.", statioOut)
 			}
 
 			// 2. Print the exact cosign identity to paste on the server, from the repo
 			//    detected above. Local git read, so it works for private repos too.
 			if repoOK {
 				ident := buildIdentity(owner, repo, workflow, branch)
-				sectionTitle("Signing identity — accept this app ON THE SERVER 🖥️")
+				sectionTitle("Signing identity · accept this app on the server 🖥️")
 				info("Detected your repo: %s/%s  (branch %s, workflow %s)", owner, repo, branch, workflow)
 				info("Cosign identity: %s", ident)
-				info("On the server, run 'statio app add' and enter this repo when asked — it derives the")
-				info("identity above for you. Non-interactive:")
+				info("On the server, run 'statio app add' and enter this repo when it asks. It derives")
+				info("the identity above for you. Without prompts:")
 				codeBlock("sudo statio app add " + service + " --repo " + owner + "/" + repo + " --workflow " + workflow + " --branch " + branch + " --image " + image)
 			} else {
-				info("Could not detect the repo from git (is there an 'origin' remote?). On the server, run 'statio app add' and enter your owner/repo by hand.")
+				info("No repo detected from git. Check for an 'origin' remote. On the server, run 'statio app add' and type your owner/repo by hand.")
 			}
 
 			// 3. Workflow: never modify an existing one. Detect + adapt.
 			existing := detectWorkflows()
 			switch {
 			case len(existing) > 0:
-				sectionTitle("You already have CI — add statio as a step 💻")
+				sectionTitle("You already have CI · add statio as a step 💻")
 				info("Detected: %s", strings.Join(existing, ", "))
-				info("statio does NOT touch your workflow. Add this step where you build and sign your image:")
+				info("statio leaves your workflow alone. Add this step where you build your image:")
 				printSnippet(target, service, image, actionRef)
 			default:
 				gen := createWorkflow
 				if !gen && interactive() {
-					ok, err := confirm("No CI workflow detected. Generate a ready-to-use .github/workflows/deploy.yml?")
+					ok, err := confirm("No CI workflow found. Generate .github/workflows/deploy.yml?")
 					if err != nil {
 						return err
 					}
@@ -460,7 +802,7 @@ func newInitRepoCmd() *cobra.Command {
 				}
 				if gen {
 					if _, err := os.Stat(out); err == nil {
-						info("%s already exists; not overwriting. Use this step:", out)
+						info("%s already exists. Leaving it alone. Use this step:", out)
 						printSnippet(target, service, image, actionRef)
 					} else {
 						yml, err := render("deploy.yml.tmpl", map[string]string{"Target": target, "Service": service, "Image": image, "ActionRef": actionRef})
@@ -488,8 +830,8 @@ func newInitRepoCmd() *cobra.Command {
 				"gh secret set STATIO_TS_OAUTH_SECRET    --body '<CI tag:ci OAuth client secret>'",
 				"gh secret set DATABASE_URL              --body '<the value of each env your statio.yaml requires>'",
 			)
-			info("The two STATIO_TS_OAUTH_* secrets are CI's own tag:ci OAuth client (created in the")
-			info("Tailscale console); the same pair works for every repo — set them org-wide if you like.")
+			info("The two STATIO_TS_OAUTH_* secrets hold CI's own tag:ci OAuth client, created in the")
+			info("Tailscale console. The same pair works for every repo, so you can set them org-wide.")
 			return nil
 		},
 	}

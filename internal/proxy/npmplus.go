@@ -17,10 +17,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -55,14 +57,31 @@ type Client struct {
 	tokenExp time.Time
 }
 
-// New builds a client. baseURL is e.g. http://npmplus:81 or http://127.0.0.1:81.
-func New(baseURL, identity, secret string) *Client {
-	return &Client{
+// Option customizes the client.
+type Option func(*Client)
+
+// WithInsecureTLS accepts the NPMplus admin API's self-signed certificate. NPMplus serves its
+// admin port over HTTPS with a self-signed cert by default, and the agent reaches it over host
+// loopback (the config validator only allows this flag for a loopback base_url), so skipping
+// chain verification here does not open a network MITM surface.
+func WithInsecureTLS() Option {
+	return func(c *Client) {
+		c.hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+}
+
+// New builds a client. baseURL is e.g. http://npmplus:81 or https://127.0.0.1:81.
+func New(baseURL, identity, secret string, opts ...Option) *Client {
+	c := &Client{
 		baseURL:  baseURL,
 		identity: identity,
 		secret:   secret,
 		hc:       &http.Client{Timeout: 15 * time.Second},
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 type tokenReq struct {
@@ -71,8 +90,36 @@ type tokenReq struct {
 }
 
 type tokenResp struct {
-	Token   string `json:"token"`
-	Expires int64  `json:"expires"`
+	Token   string   `json:"token"`
+	Expires flexTime `json:"expires"`
+}
+
+// flexTime tolerates every `expires` shape seen across NPM/NPMplus builds: a unix epoch number,
+// a numeric string, or an RFC3339 date string. An unrecognized shape parses as zero — the caller
+// then falls back to a fixed refresh interval, because expiry is only a refresh optimization and
+// must never fail authentication (a token was already minted).
+type flexTime struct{ t time.Time }
+
+func (f *flexTime) UnmarshalJSON(b []byte) error {
+	var n int64
+	if json.Unmarshal(b, &n) == nil {
+		if n > 0 {
+			f.t = time.Unix(n, 0)
+		}
+		return nil
+	}
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		if ts, err := time.Parse(time.RFC3339, s); err == nil {
+			f.t = ts
+			return nil
+		}
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+			f.t = time.Unix(n, 0)
+		}
+		return nil
+	}
+	return nil // tolerate null/objects too: absent expiry, default refresh
 }
 
 // authenticate mints (or refreshes) a bearer token.
@@ -88,9 +135,9 @@ func (c *Client) authenticate(ctx context.Context) error {
 		return fmt.Errorf("npmplus auth: empty token")
 	}
 	c.token = out.Token
-	// Refresh a minute before stated expiry; default to 30m if unset.
-	if out.Expires > 0 {
-		c.tokenExp = time.Unix(out.Expires, 0).Add(-time.Minute)
+	// Refresh a minute before stated expiry; default to 30m if unset/unrecognized.
+	if !out.Expires.t.IsZero() {
+		c.tokenExp = out.Expires.t.Add(-time.Minute)
 	} else {
 		c.tokenExp = time.Now().Add(30 * time.Minute)
 	}
@@ -114,6 +161,17 @@ type proxyHost struct {
 	CachingEnabled bool     `json:"caching_enabled"`
 	AdvancedConfig string   `json:"advanced_config"`
 	Enabled        bool     `json:"enabled"`
+}
+
+// Check is a READ-ONLY reachability + auth probe: it mints a token (proving the agent's NPMplus
+// credentials are valid) and lists proxy hosts (proving the API answers). It creates and changes
+// nothing, so preflight can confirm NPMplus is usable before a deploy depends on it.
+func (c *Client) Check(ctx context.Context) error {
+	if err := c.authenticate(ctx); err != nil {
+		return err
+	}
+	var hosts []proxyHost
+	return c.do(ctx, http.MethodGet, "/api/nginx/proxy-hosts", nil, &hosts, true)
 }
 
 // ReconcileProxyHost performs an idempotent create-or-update keyed by domain.

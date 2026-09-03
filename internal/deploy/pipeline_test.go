@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/accentiostudios/statio/internal/config"
 	"github.com/accentiostudios/statio/internal/env"
+	"github.com/accentiostudios/statio/internal/proxy"
 	"github.com/accentiostudios/statio/internal/spec"
 )
 
@@ -23,10 +25,16 @@ func (f *fakeVerifier) Verify(ctx context.Context, repo, digest string, s Effect
 	return f.err
 }
 
-type fakePuller struct{ called bool }
+type fakePuller struct {
+	called bool
+	err    error
+}
 
 func (f *fakePuller) Pull(ctx context.Context, ref string, auth *spec.RegistryAuth) (string, error) {
 	f.called = true
+	if f.err != nil {
+		return "", f.err
+	}
 	return ref[strings.Index(ref, "@")+1:], nil // resolved digest
 }
 
@@ -80,7 +88,10 @@ rollback:
 	d := &Deployer{
 		Cfg: cfg, Manifest: m, StatePath: filepath.Join(dir, "state.json"),
 		Verifier: v, Puller: p, Resolve: env.ResolveFileSecret, Audience: "statio",
-		Now: func() string { return "t0" }, Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		// Runtime probes are injected so tests never exec the host's real docker/statfs.
+		ComposeCheck: func(context.Context) error { return nil },
+		TmpFree:      func() (uint64, error) { return 10 << 30, nil },
+		Now:          func() string { return "t0" }, Log: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}
 	return d, v, p
 }
@@ -191,6 +202,202 @@ func TestRunRejectsBindingViolations(t *testing.T) {
 	r = req(t, func(r *spec.DeployRequest) { r.DeploySeq = 5 })
 	if res, _ := d.Run(context.Background(), r); res.State != StateFailure || v.called {
 		t.Fatalf("replayed (older) seq must fail before verify; state=%s verify=%v", res.State, v.called)
+	}
+}
+
+// fakeProxy implements ProxyProvider for preflight tests. checkErr drives the read-only probe.
+type fakeProxy struct {
+	checkErr     error
+	checkCalled  bool
+	reconcileErr error
+}
+
+func (f *fakeProxy) Check(ctx context.Context) error {
+	f.checkCalled = true
+	return f.checkErr
+}
+func (f *fakeProxy) ReconcileProxyHost(ctx context.Context, _ proxy.HostSpec) (proxy.Result, error) {
+	return proxy.Result{Action: "noop"}, f.reconcileErr
+}
+
+func TestPreflightOKWithoutProxy(t *testing.T) {
+	d, v, p := setup(t, "")
+	res, err := d.Preflight(context.Background(), req(t, nil))
+	if err != nil {
+		t.Fatalf("preflight err: %v", err)
+	}
+	if res.State != StatePreflightOK {
+		t.Fatalf("state = %s, want %s", res.State, StatePreflightOK)
+	}
+	if v.called || p.called {
+		t.Fatal("preflight must NOT verify or pull (read-only)")
+	}
+	// Preflight is READ-ONLY: it peeks the would-be host port but must NOT persist anything.
+	if _, err := os.Stat(d.portsPath()); !os.IsNotExist(err) {
+		t.Fatalf("preflight must not write ports.json (read-only); stat err=%v", err)
+	}
+}
+
+func TestPreflightFailsRepoMismatchBeforePorts(t *testing.T) {
+	d, _, _ := setup(t, "")
+	r := req(t, func(r *spec.DeployRequest) { r.Image.Repository = "ghcr.io/evil/x" })
+	res, _ := d.Preflight(context.Background(), r)
+	if res.State != StateFailure {
+		t.Fatalf("state = %s, want failure", res.State)
+	}
+	// It must not have reached the ports stage.
+	for _, s := range res.Stages {
+		if s.Stage == "ports" {
+			t.Fatal("repo mismatch must fail at admit, before port allocation")
+		}
+	}
+}
+
+func TestPreflightProxyUnconfigured(t *testing.T) {
+	d, _, _ := setup(t, "") // no Proxy provider wired
+	r := req(t, func(r *spec.DeployRequest) {
+		r.Proxy = &spec.ProxySpec{Enabled: true, Domain: "api.example.com", Scheme: "http"}
+	})
+	res, _ := d.Preflight(context.Background(), r)
+	if res.State != StateFailure {
+		t.Fatalf("state = %s, want failure", res.State)
+	}
+	last := res.Stages[len(res.Stages)-1]
+	if last.Stage != "proxy" || last.Code != "proxy_unconfigured" {
+		t.Fatalf("want proxy/proxy_unconfigured, got %s/%s", last.Stage, last.Code)
+	}
+}
+
+func TestPreflightProxyUnreachable(t *testing.T) {
+	d, _, _ := setup(t, "")
+	fp := &fakeProxy{checkErr: context.DeadlineExceeded}
+	d.Proxy = fp
+	r := req(t, func(r *spec.DeployRequest) {
+		r.Proxy = &spec.ProxySpec{Enabled: true, Domain: "api.example.com", Scheme: "http"}
+	})
+	res, _ := d.Preflight(context.Background(), r)
+	if !fp.checkCalled {
+		t.Fatal("preflight should have probed NPMplus reachability")
+	}
+	last := res.Stages[len(res.Stages)-1]
+	if res.State != StateFailure || last.Code != "proxy_unreachable" {
+		t.Fatalf("want failure proxy_unreachable, got %s/%s", res.State, last.Code)
+	}
+}
+
+func TestPreflightProxyOK(t *testing.T) {
+	d, _, _ := setup(t, "")
+	d.Proxy = &fakeProxy{}
+	r := req(t, func(r *spec.DeployRequest) {
+		r.Proxy = &spec.ProxySpec{Enabled: true, Domain: "api.example.com", Scheme: "http"}
+	})
+	res, err := d.Preflight(context.Background(), r)
+	if err != nil || res.State != StatePreflightOK {
+		t.Fatalf("want preflight_ok, got state=%s err=%v", res.State, err)
+	}
+}
+
+func TestRunClassifiesMidDeployNoSpaceAsDiskFull(t *testing.T) {
+	// The field failure: the pull credential write died with ENOSPC and CI saw an opaque
+	// [internal]. The stable ENOSPC cause must surface to CI as disk_full + its cleanup hint.
+	d, _, p := setup(t, "")
+	p.err = fmt.Errorf("prepare registry credential: mkdir /tmp/statio-pull123: no space left on device")
+	res, _ := d.Run(context.Background(), req(t, nil))
+	if res.State != StateFailure {
+		t.Fatalf("want failure, got %s", res.State)
+	}
+	last := res.Stages[len(res.Stages)-1]
+	if last.Stage != "pull" || last.Code != "disk_full" {
+		t.Fatalf("want pull/disk_full, got %s/%s", last.Stage, last.Code)
+	}
+	if last.Hint == "" {
+		t.Fatal("disk_full must carry the cleanup hint")
+	}
+}
+
+func TestIsNoSpace(t *testing.T) {
+	if !isNoSpace(fmt.Errorf("mkdir /tmp/x: no space left on device"), "") {
+		t.Fatal("ENOSPC error text must match")
+	}
+	if !isNoSpace(nil, "failed to register layer: no space left on device") {
+		t.Fatal("ENOSPC in raw compose output must match")
+	}
+	if isNoSpace(fmt.Errorf("connection refused"), "some output") {
+		t.Fatal("unrelated errors must not classify as disk_full")
+	}
+}
+
+func TestPreflightComposeUnavailable(t *testing.T) {
+	// The field failure: server without the docker compose v2 plugin — every deploy died
+	// mid-recreate with an opaque exit 125. Preflight must catch it with a clear code.
+	d, _, _ := setup(t, "")
+	d.ComposeCheck = func(context.Context) error { return fmt.Errorf("unknown shorthand flag: 'f' in -f") }
+	res, _ := d.Preflight(context.Background(), req(t, nil))
+	last := res.Stages[len(res.Stages)-1]
+	if res.State != StateFailure || last.Code != "compose_unavailable" {
+		t.Fatalf("want failure compose_unavailable, got %s/%s", res.State, last.Code)
+	}
+}
+
+func TestPreflightDiskFull(t *testing.T) {
+	d, _, _ := setup(t, "")
+	d.TmpFree = func() (uint64, error) { return 10 << 20, nil } // 10 MB — below the floor
+	res, _ := d.Preflight(context.Background(), req(t, nil))
+	last := res.Stages[len(res.Stages)-1]
+	if res.State != StateFailure || last.Code != "disk_full" {
+		t.Fatalf("want failure disk_full, got %s/%s", res.State, last.Code)
+	}
+}
+
+func TestPreflightDiskProbeErrorIsNotFatal(t *testing.T) {
+	// A failing statfs must not block a deploy — the floor only applies when we could measure.
+	d, _, _ := setup(t, "")
+	d.TmpFree = func() (uint64, error) { return 0, fmt.Errorf("statfs unsupported") }
+	res, err := d.Preflight(context.Background(), req(t, nil))
+	if err != nil || res.State != StatePreflightOK {
+		t.Fatalf("unmeasurable disk should not fail preflight, got state=%s err=%v", res.State, err)
+	}
+}
+
+func TestPreflightProxyNoPort(t *testing.T) {
+	d, _, _ := setup(t, "")
+	d.Proxy = &fakeProxy{}
+	r := req(t, func(r *spec.DeployRequest) {
+		r.AppIntent.Services[0].Ports = nil // app declares no port
+		r.AppIntent.Services[0].Health = nil
+		r.Proxy = &spec.ProxySpec{Enabled: true, Domain: "api.example.com", Scheme: "http"}
+	})
+	res, _ := d.Preflight(context.Background(), r)
+	last := res.Stages[len(res.Stages)-1]
+	if res.State != StateFailure || last.Code != "proxy_no_port" {
+		t.Fatalf("want failure proxy_no_port, got %s/%s", res.State, last.Code)
+	}
+}
+
+func TestPreflightInternalOnlyAppNoPortNoProxy(t *testing.T) {
+	d, _, _ := setup(t, "")
+	r := req(t, func(r *spec.DeployRequest) {
+		r.AppIntent.Services[0].Ports = nil
+		r.AppIntent.Services[0].Health = nil
+	})
+	res, err := d.Preflight(context.Background(), r)
+	if err != nil || res.State != StatePreflightOK {
+		t.Fatalf("internal-only app should preflight OK, got state=%s err=%v", res.State, err)
+	}
+}
+
+func TestPreflightFailsMissingRequiredEnv(t *testing.T) {
+	baseEnv := `apiVersion: statio/v1
+kind: ServiceEnv
+entries:
+  - key: NEEDED
+    required: true
+`
+	d, _, _ := setup(t, baseEnv)
+	r := req(t, nil) // no NEEDED override
+	res, _ := d.Preflight(context.Background(), r)
+	if res.State != StateFailure {
+		t.Fatalf("preflight should fail on a missing required env, got %s", res.State)
 	}
 }
 

@@ -31,73 +31,97 @@ func registryAuthFromEnv() *spec.RegistryAuth {
 	return &spec.RegistryAuth{Username: user, Password: pass}
 }
 
+// deployFlags is the shared input set for `deploy` and `preflight`: both read the same
+// statio.yaml, build and cosign-sign the SAME payload, and send it to the agent (to /deploy or
+// /preflight respectively), so a green preflight proves the exact bytes a deploy would send.
+type deployFlags struct {
+	target, service, image, digest, statioFile, audience string
+	deploySeq                                            int64
+	freshness                                            time.Duration
+	envs                                                 []string
+	timeout                                              time.Duration
+}
+
+func bindDeployFlags(cmd *cobra.Command, f *deployFlags, freshnessDefault time.Duration) {
+	fl := cmd.Flags()
+	fl.StringVar(&f.target, "target", "", "agent MagicDNS host (e.g. statio.tailnet.ts.net); also the signed audience")
+	fl.StringVar(&f.service, "service", "", "service slot name (must be accepted on the server)")
+	fl.StringVar(&f.image, "image", "", "your app's image repository (no tag/digest)")
+	fl.StringVar(&f.digest, "digest", "", "image digest sha256:...")
+	fl.StringVar(&f.statioFile, "statio-file", "statio.yaml", "path to the repo's statio.yaml")
+	fl.StringVar(&f.audience, "audience", "", "override the signed audience (defaults to --target)")
+	fl.Int64Var(&f.deploySeq, "deploy-seq", 0, "monotonic deploy sequence (e.g. github.run_number)")
+	fl.DurationVar(&f.freshness, "freshness", freshnessDefault, "how long the signed payload stays valid")
+	fl.StringArrayVar(&f.envs, "env", nil, "env override KEY=VALUE (repeatable; or STATIO_ENV_OVERRIDES)")
+	fl.DurationVar(&f.timeout, "timeout", 5*time.Minute, "request timeout")
+}
+
+// buildEnvelope validates the required inputs, reads statio.yaml, and builds + cosign-signs the
+// wire envelope. Shared by deploy and preflight so both send byte-identical signed payloads.
+func (f *deployFlags) buildEnvelope(ctx context.Context) ([]byte, error) {
+	var missing []string
+	if f.target == "" {
+		missing = append(missing, "--target (the agent's MagicDNS host)")
+	}
+	if f.service == "" {
+		missing = append(missing, "--service")
+	}
+	if f.image == "" {
+		missing = append(missing, "--image")
+	}
+	if f.digest == "" {
+		missing = append(missing, "--digest")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("missing required input(s): %s. Set them in the statio action's `with:` block", strings.Join(missing, ", "))
+	}
+	data, err := os.ReadFile(f.statioFile)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", f.statioFile, err)
+	}
+	pf, err := statiofile.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	envMap, err := collectEnv(f.envs)
+	if err != nil {
+		return nil, err
+	}
+	audience := f.audience
+	if audience == "" {
+		audience = f.target
+	}
+	now := time.Now().UTC()
+	in := client.Inputs{
+		Service: f.service, Repository: f.image, Digest: f.digest,
+		AppIntent: pf.AppIntent(), EnvOverrides: envMap,
+		Proxy: pf.ProxyWire(), DNS: pf.DNSWire(),
+		Audience: audience, DeploySeq: f.deploySeq,
+		IssuedAt: now.Format(time.RFC3339), Expiry: now.Add(f.freshness).Format(time.RFC3339),
+	}
+	payload, err := client.BuildSpec(in)
+	if err != nil {
+		return nil, err
+	}
+	// Forward a short-lived registry pull credential (the agent has no GitHub identity of its
+	// own). Sourced from env, NEVER argv. Absent → public image.
+	return client.SignAndWrap(ctx, payload, registryAuthFromEnv())
+}
+
 func newDeployCmd() *cobra.Command {
-	var (
-		target, service, image, digest, statioFile, audience string
-		deploySeq                                            int64
-		freshness                                            time.Duration
-		envs                                                 []string
-		strict                                               bool
-		timeout                                              time.Duration
-	)
+	var f deployFlags
+	var strict bool
 	cmd := &cobra.Command{
 		Use:   "deploy",
-		Short: "Build, cosign-sign, and send a deploy to the agent (used by the GitHub Action)",
+		Short: "Sign and send a deploy to the agent. The Action runs this.",
 		RunE: func(c *cobra.Command, _ []string) error {
-			var missing []string
-			if target == "" {
-				missing = append(missing, "--target (the agent's MagicDNS host)")
-			}
-			if service == "" {
-				missing = append(missing, "--service")
-			}
-			if image == "" {
-				missing = append(missing, "--image")
-			}
-			if digest == "" {
-				missing = append(missing, "--digest")
-			}
-			if len(missing) > 0 {
-				return fmt.Errorf("missing required deploy input(s): %s — set them in the statio action's `with:` block", strings.Join(missing, ", "))
-			}
-			data, err := os.ReadFile(statioFile)
-			if err != nil {
-				return fmt.Errorf("read %s: %w", statioFile, err)
-			}
-			pf, err := statiofile.Parse(data)
-			if err != nil {
-				return err
-			}
-			envMap, err := collectEnv(envs)
-			if err != nil {
-				return err
-			}
-			if audience == "" {
-				audience = target
-			}
-			now := time.Now().UTC()
-			in := client.Inputs{
-				Service: service, Repository: image, Digest: digest,
-				AppIntent: pf.AppIntent(), EnvOverrides: envMap,
-				Proxy: pf.ProxyWire(), DNS: pf.DNSWire(),
-				Audience: audience, DeploySeq: deploySeq,
-				IssuedAt: now.Format(time.RFC3339), Expiry: now.Add(freshness).Format(time.RFC3339),
-			}
-			payload, err := client.BuildSpec(in)
-			if err != nil {
-				return err
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), timeout+60*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), f.timeout+60*time.Second)
 			defer cancel()
-			// Forward a short-lived registry pull credential to the agent (it has no GitHub identity
-			// of its own). Sourced from env, NEVER argv: the Action sets STATIO_REGISTRY_PASSWORD from
-			// ${{ github.token }} (same token build-sign.sh logs into GHCR with). Absent → public image.
-			envelope, err := client.SignAndWrap(ctx, payload, registryAuthFromEnv())
+			envelope, err := f.buildEnvelope(ctx)
 			if err != nil {
 				return err
 			}
-			res, status, err := client.Deploy(ctx, target, envelope, timeout)
+			res, status, err := client.Deploy(ctx, f.target, envelope, f.timeout)
 			if err != nil {
 				return err
 			}
@@ -105,19 +129,62 @@ func newDeployCmd() *cobra.Command {
 			return exitForResult(res, status, strict)
 		},
 	}
-	f := cmd.Flags()
-	f.StringVar(&target, "target", "", "agent MagicDNS host (e.g. statio.tailnet.ts.net); also the signed audience")
-	f.StringVar(&service, "service", "", "service slot name (must be accepted on the server)")
-	f.StringVar(&image, "image", "", "your app's image repository (no tag/digest)")
-	f.StringVar(&digest, "digest", "", "image digest sha256:...")
-	f.StringVar(&statioFile, "statio-file", "statio.yaml", "path to the repo's statio.yaml")
-	f.StringVar(&audience, "audience", "", "override the signed audience (defaults to --target)")
-	f.Int64Var(&deploySeq, "deploy-seq", 0, "monotonic deploy sequence (e.g. github.run_number)")
-	f.DurationVar(&freshness, "freshness", 5*time.Minute, "how long the signed payload stays valid")
-	f.StringArrayVar(&envs, "env", nil, "env override KEY=VALUE (repeatable; or STATIO_ENV_OVERRIDES)")
-	f.BoolVar(&strict, "strict", false, "treat success_degraded as failure")
-	f.DurationVar(&timeout, "timeout", 5*time.Minute, "deploy timeout")
+	bindDeployFlags(cmd, &f, 5*time.Minute)
+	cmd.Flags().BoolVar(&strict, "strict", false, "treat success_degraded as failure")
 	return cmd
+}
+
+func newPreflightCmd() *cobra.Command {
+	var f deployFlags
+	cmd := &cobra.Command{
+		Use:   "preflight",
+		Short: "Dry-run a deploy: check ports and edge readiness, change nothing",
+		Long: "Sends the same signed payload a deploy would, to the agent's read-only /preflight\n" +
+			"endpoint. The agent checks it can allocate the app's host port, with no conflict\n" +
+			"against another app. When your statio.yaml asks for a public domain, it also checks\n" +
+			"NPMplus is configured and reachable and that the domain is allowlisted. It changes\n" +
+			"nothing on the server.\n\n" +
+			"The Action runs this before every deploy. A failed check exits non-zero.",
+		RunE: func(c *cobra.Command, _ []string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), f.timeout+60*time.Second)
+			defer cancel()
+			envelope, err := f.buildEnvelope(ctx)
+			if err != nil {
+				return err
+			}
+			res, status, err := client.Preflight(ctx, f.target, envelope, f.timeout)
+			if err != nil {
+				return err
+			}
+			printResult(res, status)
+			return exitForPreflight(res, status)
+		},
+	}
+	bindDeployFlags(cmd, &f, 5*time.Minute)
+	return cmd
+}
+
+// exitForPreflight maps a preflight report to a process exit: success only when the agent
+// returned the preflight_ok state. Anything else (a failed check, or an admission rejection that
+// returned no state) is a non-zero exit with the agent's own reason.
+func exitForPreflight(res *deploy.Result, status int) error {
+	if res.State == deploy.StatePreflightOK {
+		return nil
+	}
+	reason := res.Error
+	if reason == "" {
+		if s := firstFailedStage(res); s != nil {
+			reason = strings.TrimSpace(s.Stage + " " + s.Code + ": " + s.Message)
+		}
+	}
+	if reason == "" {
+		reason = fmt.Sprintf("state %q", res.State)
+	}
+	msg := fmt.Sprintf("preflight failed (HTTP %d): %s", status, reason)
+	if hint := deployFailureHint(status); status != http.StatusOK && hint != "" {
+		msg += "\n  hint: " + hint
+	}
+	return errors.New(msg)
 }
 
 // collectEnv merges repeatable --env flags with the optional STATIO_ENV_OVERRIDES dotenv
@@ -131,7 +198,7 @@ func collectEnv(flags []string) (map[string]string, error) {
 		}
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
-			return fmt.Errorf("invalid env entry %q (want KEY=VALUE)", line)
+			return fmt.Errorf("invalid env entry %q: expected KEY=VALUE", line)
 		}
 		out[strings.TrimSpace(k)] = v
 		return nil
@@ -187,7 +254,7 @@ func exitForResult(res *deploy.Result, status int, strict bool) error {
 		return nil
 	case deploy.StateSuccessDegraded:
 		if strict {
-			return fmt.Errorf("deploy degraded (--strict)")
+			return fmt.Errorf("deploy degraded, and --strict is set")
 		}
 		return nil
 	}
@@ -223,24 +290,24 @@ func deployFailureHint(status int) string {
 	switch status {
 	case http.StatusForbidden: // 403
 		return "the agent rejected the signature. The cosign signer pinned by `statio app add` must " +
-			"match your workflow's signing identity EXACTLY — owner/repo is case-sensitive " +
+			"match your workflow's signing identity exactly. owner/repo is case-sensitive. " +
 			"(e.g. AccentioStudios, not accentiostudios), plus the workflow file and branch. " +
 			"Check it with `statio app list` and fix it with `statio app edit <service>`. " +
 			"(Other 403 causes: the deploy's audience ≠ the agent host, or an expired/replayed payload.)"
 	case http.StatusNotFound: // 404
-		return "that service isn't accepted on the server — run `sudo statio app add <service>`. " +
+		return "that service is not accepted on the server. Run `sudo statio app add <service>`. " +
 			"The name must match `service:` in the workflow AND `name:` in statio.yaml."
 	case http.StatusConflict: // 409
-		return "replayed/old deploy sequence — this payload is older than one already applied."
+		return "replayed or old deploy sequence: this payload is older than one already applied."
 	case http.StatusRequestEntityTooLarge: // 413
-		return "the payload is too large — check your statio.yaml isn't enormous."
+		return "the payload is too large. Check the size of your statio.yaml."
 	case http.StatusUnprocessableEntity: // 422
 		return "an env value was rejected (a protected key, or a required value missing)."
 	case http.StatusBadRequest: // 400
-		return "the deploy spec was rejected — check your statio.yaml and the action inputs."
+		return "the deploy spec was rejected. Check your statio.yaml and the action inputs."
 	default:
 		if status >= 500 {
-			return "the agent errored — check `sudo journalctl -u statio-agent` on the server."
+			return "the agent errored. Read `sudo journalctl -u statio-agent` on the server."
 		}
 		return ""
 	}
